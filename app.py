@@ -13,8 +13,6 @@ from selenium.common.exceptions import (
     TimeoutException,
     NoSuchElementException,
 )
-import re
-import time
 
 app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
@@ -25,7 +23,6 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
 def allowed_file(filename):
-    """Check if the uploaded file is a PDF."""
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
@@ -38,10 +35,7 @@ def scrape_item_quantity(item_name):
     driver = webdriver.Chrome(options=options)
 
     try:
-        # Navigate to Amazon
         driver.get("https://www.amazon.com")
-
-        # Search for the item name
         search_box = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.ID, "twotabsearchtextbox"))
         )
@@ -49,48 +43,33 @@ def scrape_item_quantity(item_name):
         search_box.send_keys(item_name)
         search_box.send_keys(Keys.RETURN)
 
-        # Wait for the search results to load
         WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, ".s-main-slot .s-result-item"))
         )
 
-        # Re-fetch the first result to avoid stale element error
         first_result = driver.find_elements(By.CSS_SELECTOR, ".s-main-slot .s-result-item")[0]
         first_result.click()
 
-        # Wait for the product page to load
         WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.ID, "productTitle"))
         )
-
-        # Scrape the product title
         product_title = driver.find_element(By.ID, "productTitle").text
 
-        # Extract quantity from the title
         match = re.search(r"(\d+)\s*(count|pack|pcs|pieces|ct)", product_title, re.IGNORECASE)
         if match:
-            return match.group(1)  # Return the quantity
+            return match.group(1)
         else:
             return "Quantity not found"
 
-    except StaleElementReferenceException:
-        # Refetch the element if stale
-        return "Error: Element became stale. Retry scraping."
-
-    except TimeoutException:
-        return "Error: Timed out while waiting for elements."
-
+    except (StaleElementReferenceException, TimeoutException):
+        return "Error while scraping. Please retry."
     except Exception as e:
         return f"Error: {e}"
-
     finally:
         driver.quit()
 
 
 def parse_extracted_text(extracted_text):
-    """
-    Parses the extracted text to identify order details, items, and charges.
-    """
     parsed_data = {}
 
     def safe_extract(pattern, text, group=1):
@@ -99,34 +78,27 @@ def parse_extracted_text(extracted_text):
             return match.group(group)
         return "N/A"
 
-    # Extract order summary details
     parsed_data["order_date"] = safe_extract(r"Order Placed: (.+)", extracted_text)
     parsed_data["order_number"] = safe_extract(r"Amazon\.com order number: (.+)", extracted_text)
     parsed_data["order_total"] = safe_extract(r"Order Total: (\$[\d.,]+)", extracted_text)
     parsed_data["status"] = "Not Yet Shipped" if "Not Yet Shipped" in extracted_text else "N/A"
 
-    # Extract items ordered
     items = []
     item_blocks = re.findall(r"(\d+) of: (.+?)Condition: New\$(\d+\.\d+)", extracted_text, re.DOTALL)
 
     for item in item_blocks:
         quantity, name, price = item
         quantity = int(quantity)
-
-        # Consolidate items with same name and price
         existing_item = next((i for i in items if i["name"] == name.strip() and i["price"] == price), None)
         if existing_item:
             existing_item["quantity"] += quantity
         else:
             items.append({"quantity": quantity, "name": name.strip(), "price": price})
 
-    # Enrich items with exact quantity using web scraping
     for item in items:
         item["exact_quantity"] = scrape_item_quantity(item["name"])
 
     parsed_data["items"] = items
-
-    # Extract charges
     parsed_data["charges"] = {
         "subtotal": safe_extract(r"Item\(s\) Subtotal: (\$[\d.,]+)", extracted_text),
         "shipping": safe_extract(r"Shipping & Handling: (\$[\d.,]+)", extracted_text),
@@ -139,16 +111,13 @@ def parse_extracted_text(extracted_text):
 
 
 def format_parsed_data(parsed_data):
-    """
-    Formats parsed data into structured HTML with a table for items.
-    """
     table_rows = "".join(
         f"<tr><td>{item['quantity']}</td><td>{item['name']}</td><td>${item['price']}</td><td>{item['exact_quantity']}</td></tr>"
         for item in parsed_data["items"]
     )
     items_table_html = f"""
-    <table border="1" style="width: 100%; border-collapse: collapse; text-align: left;">
-        <thead>
+    <table class="table table-striped table-hover">
+        <thead class="table-dark">
             <tr>
                 <th>Quantity</th>
                 <th>Item Name</th>
@@ -163,18 +132,21 @@ def format_parsed_data(parsed_data):
     """
 
     charges_html = "".join(
-        f"<li><strong>{key.replace('_', ' ').title()}:</strong> {value}</li>"
+        f"<li class='list-group-item'><strong>{key.replace('_', ' ').title()}:</strong> {value}</li>"
         for key, value in parsed_data["charges"].items()
     )
 
     return f"""
-    <h1>Order Summary:</h1>
-    {items_table_html}
-    <h3>Summary of Charges:</h3>
-    <ul>{charges_html}</ul>
+    <div class="container mt-4">
+        <h1 class="my-4">Order Summary:</h1>
+        {items_table_html}
+        <h3 class="mt-5">Summary of Charges:</h3>
+        <ul class="list-group">{charges_html}</ul>
+    </div>
     """
 
 
+@app.route("/", methods=["GET", "POST"])
 @app.route("/", methods=["GET", "POST"])
 def upload_pdf():
     if request.method == "POST":
@@ -196,18 +168,78 @@ def upload_pdf():
         except Exception as e:
             return f"An error occurred: {e}", 500
         finally:
-            os.remove(file_path)  # Clean up uploaded file
+            os.remove(file_path)
 
-        return f"<h1>Extracted Text:</h1>{formatted_text}"
+        return render_template_string(f"""
+        <!doctype html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+            <title>PDF Order Details</title>
+        </head>
+        <body>
+            {formatted_text}
+        </body>
+        </html>
+        """)
 
     return '''
         <!doctype html>
-        <title>Upload PDF</title>
-        <h1>Upload a PDF file</h1>
-        <form method="post" enctype="multipart/form-data">
-            <input type="file" name="file" accept="application/pdf">
-            <input type="submit" value="Upload">
-        </form>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+            <style>
+                body {
+                    background: linear-gradient(135deg, #ffd700, #1e90ff);
+                    min-height: 100vh;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    font-family: 'Arial', sans-serif;
+                }
+                .upload-container {
+                    background-color: #fff;
+                    border-radius: 10px;
+                    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
+                    max-width: 400px;
+                    width: 100%;
+                    padding: 2rem;
+                    text-align: center;
+                }
+                .upload-container h1 {
+                    color: #1e90ff;
+                    margin-bottom: 1.5rem;
+                }
+                .btn-primary {
+                    background-color: #ffd700;
+                    border-color: #ffd700;
+                    color: #1e90ff;
+                }
+                .btn-primary:hover {
+                    background-color: #1e90ff;
+                    border-color: #1e90ff;
+                    color: #ffd700;
+                }
+            </style>
+            <title>Upload PDF</title>
+        </head>
+        <body>
+            <div class="upload-container">
+                <h1>Upload a PDF File</h1>
+                <form method="post" enctype="multipart/form-data">
+                    <div class="mb-3">
+                        <label for="file" class="form-label">Choose a PDF File:</label>
+                        <input type="file" name="file" class="form-control" accept="application/pdf" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">Upload</button>
+                </form>
+            </div>
+        </body>
+        </html>
     '''
 
 
