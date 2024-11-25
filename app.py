@@ -1,13 +1,90 @@
-from flask import Flask, request
+from flask import Flask, request, render_template_string
 from pdf_utils import extract_text_from_pdf  # Import the utility function
 import os
 import re
+from werkzeug.utils import secure_filename
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (
+    StaleElementReferenceException,
+    TimeoutException,
+    NoSuchElementException,
+)
+import re
+import time
 
 app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
+ALLOWED_EXTENSIONS = {"pdf"}
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+def allowed_file(filename):
+    """Check if the uploaded file is a PDF."""
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def scrape_item_quantity(item_name):
+    """
+    Uses Selenium to scrape the exact quantity of an item from a shopping website.
+    """
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")  # Run in headless mode
+    driver = webdriver.Chrome(options=options)
+
+    try:
+        # Navigate to Amazon
+        driver.get("https://www.amazon.com")
+
+        # Search for the item name
+        search_box = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.ID, "twotabsearchtextbox"))
+        )
+        search_box.clear()
+        search_box.send_keys(item_name)
+        search_box.send_keys(Keys.RETURN)
+
+        # Wait for the search results to load
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".s-main-slot .s-result-item"))
+        )
+
+        # Re-fetch the first result to avoid stale element error
+        first_result = driver.find_elements(By.CSS_SELECTOR, ".s-main-slot .s-result-item")[0]
+        first_result.click()
+
+        # Wait for the product page to load
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.ID, "productTitle"))
+        )
+
+        # Scrape the product title
+        product_title = driver.find_element(By.ID, "productTitle").text
+
+        # Extract quantity from the title
+        match = re.search(r"(\d+)\s*(count|pack|pcs|pieces|ct)", product_title, re.IGNORECASE)
+        if match:
+            return match.group(1)  # Return the quantity
+        else:
+            return "Quantity not found"
+
+    except StaleElementReferenceException:
+        # Refetch the element if stale
+        return "Error: Element became stale. Retry scraping."
+
+    except TimeoutException:
+        return "Error: Timed out while waiting for elements."
+
+    except Exception as e:
+        return f"Error: {e}"
+
+    finally:
+        driver.quit()
 
 
 def parse_extracted_text(extracted_text):
@@ -32,18 +109,20 @@ def parse_extracted_text(extracted_text):
     items = []
     item_blocks = re.findall(r"(\d+) of: (.+?)Condition: New\$(\d+\.\d+)", extracted_text, re.DOTALL)
 
-    # Consolidate items with same name and price
     for item in item_blocks:
         quantity, name, price = item
-        quantity = int(quantity)  # Convert quantity to integer for addition
+        quantity = int(quantity)
 
-        # Check if item with same name and price already exists
+        # Consolidate items with same name and price
         existing_item = next((i for i in items if i["name"] == name.strip() and i["price"] == price), None)
-
         if existing_item:
-            existing_item["quantity"] += quantity  # Add the quantity to the existing item
+            existing_item["quantity"] += quantity
         else:
             items.append({"quantity": quantity, "name": name.strip(), "price": price})
+
+    # Enrich items with exact quantity using web scraping
+    for item in items:
+        item["exact_quantity"] = scrape_item_quantity(item["name"])
 
     parsed_data["items"] = items
 
@@ -56,43 +135,15 @@ def parse_extracted_text(extracted_text):
         "grand_total": safe_extract(r"Grand Total:\s*(\$[\d.,]+)", extracted_text),
     }
 
-    # Extract shipping address
-    address_match = re.search(
-        r"Shipping Address:\n(.+?)\n(.+?)\n(.+?)\n(.+)", extracted_text, re.DOTALL
-    )
-    parsed_data["shipping_address"] = {
-        "name": address_match.group(1) if address_match and len(address_match.groups()) >= 4 else "N/A",
-        "address_line_1": address_match.group(2) if address_match and len(address_match.groups()) >= 4 else "N/A",
-        "address_line_2": address_match.group(3) if address_match and len(address_match.groups()) >= 4 else "N/A",
-        "country": address_match.group(4) if address_match and len(address_match.groups()) >= 4 else "N/A",
-    }
-
-    # Extract payment information
-    payment_method = safe_extract(r"Payment Method:\n(.+)", extracted_text)
-    billing_address_match = re.search(
-        r"Billing address\n(.+?)\n(.+?)\n(.+)", extracted_text, re.DOTALL
-    )
-    parsed_data["payment_information"] = {
-        "method": payment_method,
-        "billing_address": {
-            "name": billing_address_match.group(1) if billing_address_match and len(
-                billing_address_match.groups()) >= 3 else "N/A",
-            "address_line_1": billing_address_match.group(2) if billing_address_match and len(
-                billing_address_match.groups()) >= 3 else "N/A",
-            "country": billing_address_match.group(3) if billing_address_match and len(
-                billing_address_match.groups()) >= 3 else "N/A",
-        },
-    }
-
     return parsed_data
+
 
 def format_parsed_data(parsed_data):
     """
     Formats parsed data into structured HTML with a table for items.
     """
-    # Generate table for items
     table_rows = "".join(
-        f"<tr><td>{item['quantity']}</td><td>{item['name']}</td><td>${item['price']}</td></tr>"
+        f"<tr><td>{item['quantity']}</td><td>{item['name']}</td><td>${item['price']}</td><td>{item['exact_quantity']}</td></tr>"
         for item in parsed_data["items"]
     )
     items_table_html = f"""
@@ -102,6 +153,7 @@ def format_parsed_data(parsed_data):
                 <th>Quantity</th>
                 <th>Item Name</th>
                 <th>Price</th>
+                <th>Exact Quantity</th>
             </tr>
         </thead>
         <tbody>
@@ -110,41 +162,18 @@ def format_parsed_data(parsed_data):
     </table>
     """
 
-    # Format charges
     charges_html = "".join(
         f"<li><strong>{key.replace('_', ' ').title()}:</strong> {value}</li>"
         for key, value in parsed_data["charges"].items()
     )
 
-    # Format shipping address
-    shipping_address = parsed_data["shipping_address"]
-
-    # Format payment information
-    payment_info = parsed_data["payment_information"]
-
     return f"""
     <h1>Order Summary:</h1>
-    <p><strong>Order Date:</strong> {parsed_data['order_date']}</p>
-    <p><strong>Order Number:</strong> {parsed_data['order_number']}</p>
-    <p><strong>Order Total:</strong> {parsed_data['order_total']}</p>
-    <p><strong>Status:</strong> {parsed_data['status']}</p>
-
-    <h2>Items Ordered:</h2>
     {items_table_html}
-
     <h3>Summary of Charges:</h3>
     <ul>{charges_html}</ul>
-
-    <h3>Shipping Address:</h3>
-    <p>{shipping_address['name']}</p>
-    <p>{shipping_address['address_line_1']}</p>
-    <p>{shipping_address['address_line_2']}</p>
-    <p>{shipping_address['country']}</p>
-
-    <h3>Payment Information:</h3>
-    <p><strong>Payment Method:</strong> {payment_info['method']}</p>
-    <p><strong>Billing Address:</strong> {payment_info['billing_address']['name']}, {payment_info['billing_address']['address_line_1']}, {payment_info['billing_address']['country']}</p>
     """
+
 
 @app.route("/", methods=["GET", "POST"])
 def upload_pdf():
@@ -153,18 +182,21 @@ def upload_pdf():
             return "No file uploaded.", 400
 
         pdf_file = request.files["file"]
-        if pdf_file.filename == "":
-            return "No selected file.", 400
+        if pdf_file.filename == "" or not allowed_file(pdf_file.filename):
+            return "Invalid file type. Please upload a PDF.", 400
 
-        file_path = os.path.join(app.config["UPLOAD_FOLDER"], pdf_file.filename)
+        filename = secure_filename(pdf_file.filename)
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
         pdf_file.save(file_path)
 
-        # Use the utility function to extract text
-        extracted_text = extract_text_from_pdf(file_path)
-
-        # Parse and format the extracted text
-        parsed_data = parse_extracted_text(extracted_text)
-        formatted_text = format_parsed_data(parsed_data)
+        try:
+            extracted_text = extract_text_from_pdf(file_path)
+            parsed_data = parse_extracted_text(extracted_text)
+            formatted_text = format_parsed_data(parsed_data)
+        except Exception as e:
+            return f"An error occurred: {e}", 500
+        finally:
+            os.remove(file_path)  # Clean up uploaded file
 
         return f"<h1>Extracted Text:</h1>{formatted_text}"
 
@@ -173,7 +205,7 @@ def upload_pdf():
         <title>Upload PDF</title>
         <h1>Upload a PDF file</h1>
         <form method="post" enctype="multipart/form-data">
-            <input type="file" name="file">
+            <input type="file" name="file" accept="application/pdf">
             <input type="submit" value="Upload">
         </form>
     '''
